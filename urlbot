@@ -1,0 +1,673 @@
+#! /snacks/bin/perl
+#
+#    $Id$
+#
+# Copyright (C) 2009, 2010, 2011, 2012, 2013, 2014 by Peder Stray <peder@ifi.uio.no>
+#
+
+use strict;
+use open OUT => ':locale';
+
+use POSIX;
+use File::Path;
+use Encode;
+use DBI;
+use Data::Dumper;
+
+use POE qw{
+	      Component::IRC::State
+	      Component::IRC::Plugin::AutoJoin
+	      Component::IRC::Plugin::BotTraffic
+	      Component::IRC::Plugin::CTCP
+	      Component::IRC::Plugin::Connector
+	      Component::IRC::Plugin::NickReclaim
+	      Filter::Map
+      };
+
+use POE::Component::IRC::Common 
+  qw( l_irc parse_user strip_color strip_formatting );
+
+$| = 1;
+
+my $nick = "urlbot";
+my $name = "Jeg slår opp tittel på ting urler peker på";
+
+my @signals; # this will be populated 
+my %commands;
+my %nets;
+
+my %ok = map { lc $_ => 1 } @ARGV;
+
+# ==========[ Start up IRC bot ]==========
+
+my $homedir = $ENV{HOME};
+my $confdir = "$homedir/.urlbot";
+
+mkpath( "$confdir" );
+
+my $conf_db = db_handle('config');
+
+{
+    my $sth;
+
+    $sth = $conf_db->prepare(qq{SELECT * FROM nets});
+    $sth->execute();
+    while (my $row = $sth->fetchrow_hashref()) {
+	my $id = lc $row->{net};
+	next if keys %ok && !$ok{$id};
+	$nets{$id} = { 
+		      net => $row->{net},
+		      nick => $row->{nick} || $nick,
+		      name => $row->{name} || $name,
+		      servers => [],
+		      channels => {},
+		     };
+    }
+    $sth->finish;
+
+    $sth = $conf_db->prepare(qq(SELECT * FROM servers));
+    $sth->execute();
+    while (my $row = $sth->fetchrow_hashref()) {
+	next unless $nets{lc $row->{net}};
+	push @{$nets{lc $row->{net}}{servers}}, 
+	  [ $row->{server},
+	    $row->{port},
+	  ];
+    }
+    $sth->finish;
+
+    $sth = $conf_db->prepare(qq(SELECT * FROM channels));
+    $sth->execute;
+    while (my $row = $sth->fetchrow_hashref()) {
+	next unless $nets{lc $row->{net}};
+	$nets{lc $row->{net}}{channels}{$row->{channel}} = $row->{password};
+    }
+    $sth->finish;
+}
+
+my $joins = 0;
+for my $net (keys %nets) {
+    if (@{$nets{$net}{servers}}) {
+	my $irc = POE::Component::IRC::State->spawn
+	  (
+	   nick => $nets{$net}{nick},
+	   ircname => $nets{$net}{name},
+	   server => $nets{$net}{servers}[0][0],
+	   port => $nets{$net}{servers}[0][1] || 6667,
+	   plugin_debug => 1,
+	  )
+	    or die "Spawn failed: $!\n";
+
+	$irc->{srv_filter}->unshift
+	  ( POE::Filter::Map->new
+	    ( Get => sub { return unify(@_) },
+	      Put => sub { return $_[0] },
+	    )
+	  );
+	
+	$nets{$net}{irc} = $irc;
+	$irc->{net} = $nets{$net};
+	
+	POE::Session->create
+	    (
+	     package_states => [ main => [ @signals ] ],
+	     heap => { irc => $irc,
+		       net => $nets{$net}{net},
+		       netid => $net,
+		     },
+	    );
+	$joins++;
+    }
+}
+
+
+$poe_kernel->run() if $joins;
+
+exit;
+
+sub unify {
+    my(@msg) = @_;
+    my(@ret);
+
+    for (@msg) {
+	push @ret, "";
+	while (length) {
+	    $ret[-1] .= decode("utf8", $_, Encode::FB_QUIET);
+	    $ret[-1] .= substr $_, 0, 1, "";
+	}
+    }
+
+    return wantarray ? @ret : "@ret";
+}
+
+sub message {
+    my(@msg) = @_;
+    my $out = '';
+    for my $msg (@msg) {
+	if (ref $msg) {
+	    my($fmt,@params) = @$msg;
+	    $fmt =~ s/\n*$/\n/;
+	    $out .= sprintf $fmt, @params;
+	}
+	else {
+	    $msg =~ s/\n*$/\n/;
+	    $out .= $msg;
+	}
+    }
+    my $time = strftime "%m-%d %H:%M:%S", localtime;
+    for ($out) {
+	s/^/\e[36m$time\e[m /gm; #
+    }
+    print $out;
+}
+
+sub db_handle {
+    my($name) = @_;
+    return DBI->connect("dbi:SQLite:dbname=$confdir/$name.sqlite");
+}
+
+# ==========[ magic setup ]==========
+
+sub MODIFY_CODE_ATTRIBUTES {
+    my($pkg,$sub,@attrs) = @_;
+    my($sig,$desc,@unknown);
+    
+    for (@attrs) {
+ 	if (/^signal$/) {
+	    $sig++;
+	}
+	elsif (/^cmd\((.*)\)$/) {
+	    $desc = $1;
+	}
+	else {
+	    push @unknown;
+	}
+    }
+    push @signals, [ $sub, $desc ] if $sig;
+    return @unknown;
+}
+
+sub get_sub_name {
+    my($sub) = @_;
+
+    use B ();
+
+    my $cv = B::svref_2object($sub);
+    my $cmd_name = $cv->isa('B::CV') ? $cv->GV->NAME : "_ANON_";
+
+    $cmd_name;
+}
+
+sub INIT {
+    for my $sig (@signals) {
+	my($sub,$desc) = @$sig;
+	$sig = get_sub_name($sub);
+    }
+}
+
+# ----------[ Handlers ]----------
+
+sub _start :signal {
+    my $heap = $_[HEAP];
+
+    message([ "Starting up %s...", $heap->{net} ]);
+    
+    # retrieve our component's object from the heap where we stashed it
+    my $irc = $heap->{irc};
+    my $id = $heap->{netid};
+
+    $irc->plugin_add
+      ( AutoJoin => POE::Component::IRC::Plugin::AutoJoin->new
+	( Channels => $nets{$id}{channels},
+	  RejoinOnKick => 1,
+	  Rejoin_delay => 10,
+	  Retry_when_banned => 60,
+	)
+      );    
+    
+    $irc->plugin_add
+      ( BotTraffic => POE::Component::IRC::Plugin::BotTraffic->new
+	( )
+      );
+    
+    $irc->plugin_add
+      ( CTCP => POE::Component::IRC::Plugin::CTCP->new
+	( version  => "urlbot (POE::Component::IRC v$POE::Component::IRC::VERSION)",
+	  userinfo => "urlbot (POE::Component::IRC v$POE::Component::IRC::VERSION)",
+	)
+      );
+    
+    $irc->plugin_add
+      ( Connector => 
+	$heap->{connector} = POE::Component::IRC::Plugin::Connector->new
+	( delay => 300,
+	  reconnect => 60,
+	  servers => $nets{$id}{servers},
+	)
+      );
+    
+    $irc->plugin_add
+      ( NickReclaim =>
+	POE::Component::IRC::Plugin::NickReclaim->new
+	( poll => 30,
+	)
+      );
+
+    $irc->plugin_add
+      ( "Plugin::URL" =>
+	Plugin::URL->new
+	( $heap->{net}
+	)
+      );
+    
+    $irc->yield( register => 'all' );
+    $irc->yield( connect => { } );
+    return;
+}
+
+sub irc_001 :signal {
+    my $sender = $_[SENDER];
+    my($net) = $_[ HEAP ]->{net};
+    
+    # Since this is an irc_* event, we can get the component's object by
+    # accessing the heap of the sender. Then we register and connect to the
+    # specified server.
+    my $irc = $sender->get_heap();
+    
+    message(["Connected to %s via %s", $net, $irc->server_name() ]);
+    return;
+}
+
+sub irc_join :signal {
+    my($who) = @_[ ARG0 ];
+    my($channel) = @_[ ARG1 ];
+    my($net) = $_[ HEAP ]->{net};
+
+    message([ "Joined %s on %s: %s", $channel, $net, $who ]);
+
+    return;
+}
+
+sub irc_connected :signal {
+    my($server) = @_[ ARG0 ];
+    my($net) = $_[ HEAP ]->{net};
+
+    message(["Connecting to %s via %s", $net, $server ]);
+    return;
+}
+
+sub irc_error :signal {
+    my($error) = @_[ ARG0 ];
+    my($net) = $_[ HEAP ]->{net};
+    my $sender = $_[SENDER];
+    my $irc = $sender->get_heap();
+
+    message(["Disconnected from %s via %s:", $net, $irc->server_name() ]);
+    message(["  %s", $error]);
+    return;
+}
+
+# We registered for all events, this will produce some debug info.
+sub _default :signalx {
+    my($event, $args) = @_[ARG0 .. $#_];
+    my($net) = $_[ HEAP ]->{net};
+    my @output;
+
+    return if $net eq 'Linpro';
+    return if $net eq 'freenode';
+    
+    for my $arg (@$args) {
+	if ( ref $arg eq 'ARRAY' ) {
+	    push @output, '[' . join(', ', @$arg ) . ']';
+	}
+	else {
+	    push @output, "'$arg'" ;
+	}
+    }
+    message([ "%s \e[33m%s\e[m: %s", $net, $event, "@output" ]);
+    return 0;
+}
+
+# ----------[ BotTraffic ]----------
+
+sub irc_bot_public :signal {
+    my($who, $what) = @_[ARG0, ARG1];
+    my($net) = $_[ HEAP ]->{net};
+
+    message([ "%s \e[32mPUB\e[31m>\e[m %s: %s\n",
+	      $net,
+	      $who->[0], 
+	      strip_color($what),
+	    ],
+	  );
+    return;
+}
+
+sub irc_bot_msg :signal {
+    my($who, $what) = @_[ARG0, ARG1];
+    my($net) = $_[ HEAP ]->{net};
+
+    message([ "%s \e[33mMSG\e[31m>\e[m %s: %s\n",
+	      $net,
+	      $who->[0],
+	      strip_color($what),
+	    ],
+	   );
+    return;
+}
+
+sub irc_bot_notice :signal {
+    my($who, $what) = @_[ARG0, ARG1];
+    my($net) = $_[ HEAP ]->{net};
+
+    message([ "%s \e[35mNOTICE\e[31m>\e[m %s: %s\n",
+	      $net,
+	      $who->[0],
+	      strip_color($what),
+	    ],
+	   );
+    return;
+}
+
+sub irc_bot_action :signal {
+    my($who, $what) = @_[ARG0, ARG1];
+    my($net) = $_[ HEAP ]->{net};
+
+    message([ "\e[34mACT\e[31m>\e[m %s %s\n",
+	      $net,
+	      $who->[0],
+	      strip_color($what),
+	    ],
+	  );
+    return
+}
+
+package Plugin::URL;
+
+# Look up titles of urls, and print title
+
+use strict;
+
+use POE::Component::IRC::Plugin qw( :ALL );
+use POE::Component::IRC::Common qw( strip_color strip_formatting );
+
+use URI::Find::Simple qw( list_uris );
+use URI::Title qw( title );
+
+use DBI;
+
+our($url_db,$insert_url,$count_url, $last_use);
+
+sub new {
+    my $package = shift;
+    my($net) = @_;
+
+    $url_db = main::db_handle('urls');
+
+    $insert_url = $url_db->prepare(qq{
+insert into 
+urls(timestamp,net,channel,nick,url)
+values (datetime('now'), ?, ?, ? ,?)
+})
+      or die $url_db->errstr;
+    
+    $count_url = $url_db->prepare(qq{
+select count(timestamp) as count
+from urls
+where net = ?
+  and channel = ?
+  and url = ?
+})
+      or die $url_db->errstr;
+
+    $last_use = $url_db->prepare(qq{
+SELECT nick, datetime(timestamp,'localtime') as timestamp
+FROM urls
+where net = ?
+  and channel = ?
+  and url = ?
+order by timestamp asc
+limit 1
+})
+      or die $url_db->errstr;
+
+
+    my $self = bless { net => $net }, $package;
+    
+    return $self;    
+}
+
+sub url_info {
+    my($net, $channel, $nick, $url) = @_;
+
+    $count_url->execute($net, $channel, $url);
+    my $row = $count_url->fetchrow_hashref();
+    my $count = $row->{count};
+
+    $last_use->execute($net, $channel, $url);
+    my $row = $last_use->fetchrow_hashref();
+    my($lnick) = $row->{nick};
+    my($ltime) = $row->{timestamp};
+
+    $insert_url->execute($net, $channel, $nick, $url);
+
+    return wantarray ? ($count,$lnick,$ltime) : $count;
+}
+
+
+sub PCI_register {
+    my ($self, $irc) = @_;
+    main::message([ "Registering %s", __PACKAGE__ ]);
+    $self->{irc} = $irc;
+    $irc->plugin_register( $self, 'SERVER', qw(public msg ctcp_action url_found
+					       gc_found dx_found) );
+
+    return 1;
+}
+
+sub PCI_unregister {
+    return 1;
+}
+
+sub S_public {
+    my ($self, $irc) = splice @_, 0, 2;
+    my $from = ${ $_[0] };
+    my $to   = ${ $_[1] }->[0];
+    my $msg  = ${ $_[2] };
+
+    # simple test to avoid multiple instances
+    unless ($irc->nick_name() eq $irc->{net}{nick}) {
+	return; PCI_EAT_NONE;
+    }
+
+    $self->_do_lookup($irc,$from,$to,$msg,0);
+
+    return PCI_EAT_NONE;
+}
+
+sub S_msg {
+    my ($self, $irc) = splice @_, 0, 2;
+    my $from = ${ $_[0] };
+    my $to   = ${ $_[1] }->[0];
+    my $msg  = ${ $_[2] };
+
+    $self->_do_lookup($irc,$from,$to,$msg,1);
+
+    return PCI_EAT_NONE;
+}
+
+sub S_ctcp_action {
+    my ($self, $irc) = splice @_, 0, 2;
+    my $from = ${ $_[0] };
+    my $to   = ${ $_[1] }->[0];
+    my $msg  = ${ $_[2] };
+
+    $self->_do_lookup($irc,$from,$to,$msg,0);
+
+    return PCI_EAT_NONE;
+}
+
+sub _do_lookup {
+    my($self,$irc,$from,$to,$msg,$private) = @_;
+    my %seen;
+
+    my $strip = strip_color(strip_formatting($msg));
+
+    for (list_uris($strip)) {
+	next if $seen{$_}++;
+	main::message([ "\e[35mURL\e[m: %s - %s", $from, $_ ]);
+	$irc->send_event(url_found => $from, $to, $_, $private);
+	$strip =~ s/\Q$_//g;
+    }
+
+    while ($strip =~ /(spotify:([^:]+):(\w+))/g) {
+	next if $seen{$1}++;
+	main::message([ "\e[35mSpotify\e[m: %s - %s", $from, $1 ]);
+	$irc->send_event(url_found => $from, $to, 
+			 "http://open.spotify.com/$2/$3", $private);
+    }
+
+    while ($strip =~ /\b((?:GC|TB)[0-9A-Z]+)/gi) {
+	next if $seen{$1}++;
+	main::message([ "\e[35mGeoCaching\e[m: %s - %s", $from, $1 ]);
+	$irc->send_event(gc_found => $from, $to, $1, $private);
+    }
+
+    while ($strip =~ /\bdx:(\d+)\b/gi) {
+	next if $seen{"dx:$1"}++;
+	main::message([ "\e[35mDealExtreme\e[m: %s - %s", $from, $1 ]);
+	$irc->send_event(dx_found => $from, $to, $1, $private);
+    }
+}
+
+sub S_url_found {
+    my ($self, $irc) = splice @_, 0, 2;
+    my $from = ${ $_[0] };
+    my $to   = ${ $_[1] };
+    my $url  = ${ $_[2] };
+    my $priv = ${ $_[3] };
+    my $title;
+
+    # skip some schemes we can't or won't look up
+    if ( $url =~ /^(file|mailto):/) {
+	return PCI_EAT_NONE;
+    }
+
+    my($count,$lwho,$ltime) = url_info($self->{net}, $to, $from, $url);
+
+    $lwho =~ s/!.*//;
+
+    my $cstr = '';
+
+    if ($count) {
+	$cstr = sprintf " %d earlier post%s, first by %s at %s", $count, $count>1 ? 's':'', $lwho, $ltime;
+    }
+
+    # amazon needs special treatment
+    if ($url =~ m,//(?:\w+\.)*amazon\.(?:(?:\w+\.)?\w+)/,) {
+	$title = title({ data => URI::Title::get_limited($url,120*1024)});
+    }
+    else {
+	
+	# Try non-js-version of some new-style fragment-type urls
+	if ($url =~ m,^(\w+://[^/]*/)#!/(.*),) {
+	    $title = title("$1$2");
+	}
+	
+	# Look up if last step failed or wasn't applicable
+	$title ||= title($url);
+    }
+
+    # :pusurl!peder@nyjustu.ifi.uio.no NOTICE #lp-fritt-forum :[ yr.no – Været for Norge og verden fra NRK og Meteorologisk institutt ]
+    # '[ "Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserun'
+
+    if ($title) {
+	for ($title) {
+	    s/^\s*//s;
+	    s/\s+/ /gs;
+	    s/\s*$//s;
+	}
+	my $maxlen = 512 - 4 - length($cstr);
+
+	$irc->yield(notice => $to => "[ $title ]$cstr");
+    }
+
+    return PCI_EAT_NONE;
+}
+
+sub S_gc_found {
+    my ($self, $irc) = splice @_, 0, 2;
+    my $from = ${ $_[0] };
+    my $to   = ${ $_[1] };
+    my $gc   = uc ${ $_[2] };
+
+    $gc =~y/ILOSU/1105V/;
+
+    my $title = title("http://coord.info/$gc");
+    for ($title) {
+	s/&quot;/"/g;
+	s/&gt;/>/g;
+	s/&lt;/</g;
+	s/&amp;/&/g;
+    }
+
+    if ($title =~ s,^\($gc\) (.*),http://coord.info/$gc - [ $1 ],) {
+	$irc->yield(notice => $to => $title);
+    }
+    elsif ($title =~ s,^$gc\s*(.*\))\s*in.*,http://coord.info/$gc - [ $1 ],) {
+	$irc->yield(notice => $to => $title);
+    }
+    else {
+	main::message([ "...: %s", $title ]);
+    }
+
+    return PCI_EAT_NONE;
+}
+
+sub S_dx_found {
+    my ($self, $irc) = splice @_, 0, 2;
+    my $from = ${ $_[0] };
+    my $to   = ${ $_[1] };
+    my $dx   = ${ $_[2] };
+
+    my $url  = "http://dx.com/p/$dx";
+
+    my $title = title($url);
+    for ($title) {
+	s/&quot;/"/g;
+	s/&gt;/>/g;
+	s/&lt;/</g;
+	s/&amp;/&/g;
+    }
+
+    if ($title =~ /\s*(.*)\s+-\s+Free\s+Shipping/) {
+	$irc->yield(notice => $to => "$url - [$1]");
+    }
+    else {
+	main::message([ "...: %s", $title ]);
+    }
+
+    return PCI_EAT_NONE;
+}
+
+package URI::Find;
+
+sub new_decruft {
+    @_ == 2 || __PACKAGE__->badinvo;
+    my($self, $orig_match) = @_;
+
+    $orig_match = $self->orig_decruft($orig_match);
+
+    if ($self->{end_cruft} eq ')' && $orig_match =~ /\(/) {
+	main::message("Recrufting...");
+	$orig_match .= $self->{end_cruft};
+	$self->{end_cruft} = '';
+    }
+
+    return $orig_match;
+}
+
+*orig_decruft = *decruft;
+*decruft = *new_decruft;
+
+1;
